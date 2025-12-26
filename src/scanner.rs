@@ -1,3 +1,4 @@
+
 use crate::error::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,12 +25,6 @@ impl<'a> Scanner<'a> {
     pub fn new(source: &'a str) -> Self {
         Self { source, byte_idx: 0 }
     }
-    
-    fn remaining(&self) -> &'a str {
-        &self.source[self.byte_idx..]
-    }
-    
-
 
     pub fn scan_next(&mut self) -> Result<Option<(Token<'a>, std::ops::Range<usize>)>, Error> {
         if self.byte_idx >= self.source.len() {
@@ -37,81 +32,100 @@ impl<'a> Scanner<'a> {
         }
 
         let start = self.byte_idx;
-        let mut chars = self.remaining().char_indices();
-        
-        while let Some((idx, c)) = chars.next() {
-            let current_abs_idx = start + idx;
+        let mut current = start;
+
+        while current < self.source.len() {
+            let rem = &self.source.as_bytes()[current..];
             
-            // Handle escape sequences
-            if c == '\\' {
-                // Peek next
-                if let Some((_, _next_char)) = chars.next() {
-                    continue; // Skip next char (it's part of escape)
-                } else {
-                    continue;
-                }
-            }
-            
-            // Handle single quotes (disable interpolation)
-            if c == '\'' {
-                // Scan until closing quote
-                // We are inside a literal block now.
-                // We need to consume chars until next ' that is NOT escaped?
-                // Spec say: "Escape sequences inside single quotes are typically NOT processed (literal strings), except typically \' and \\"
-                // So valid: 'It\'s me'
-                
-                // Note: we are ALREADY iterating `chars`.
-                while let Some((_, qc)) = chars.next() {
-                    if qc == '\\' {
-                        // Consume the next char to escape it (so it doesn't trigger end quote if it is ')
-                        chars.next();
-                    } else if qc == '\'' {
-                         // Found closing quote!
-                         break;
+            match memchr::memchr3(b'$', b'\\', b'\'', rem) {
+                Some(p) => {
+                    let abs_p = current + p;
+                    let char_found = self.source.as_bytes()[abs_p];
+                    
+                    if char_found == b'\\' {
+                        // Backslash escape. Skip this backslash and the next character.
+                        if abs_p + 1 < self.source.len() {
+                            let next_str = &self.source[abs_p+1..];
+                            if let Some(c) = next_str.chars().next() {
+                                current = abs_p + 1 + c.len_utf8();
+                            } else {
+                                current = self.source.len();
+                            }
+                        } else {
+                             current = self.source.len();
+                        }
+                    } else if char_found == b'\'' {
+                        // Single quote block. Skip until closing quote.
+                        let inner_start = abs_p + 1;
+                        let inner_rem = &self.source.as_bytes()[inner_start..];
+                        
+                        let mut found_close = false;
+                        let mut scan_pos = 0;
+                        
+                        // Scan for ' or \ inside
+                        while let Some(q_pos) = memchr::memchr2(b'\'', b'\\', &inner_rem[scan_pos..]) {
+                            let abs_q = inner_start + scan_pos + q_pos;
+                            let qc = self.source.as_bytes()[abs_q];
+                            
+                            if qc == b'\\' {
+                                // Escaped char inside single quotes (e.g. \')
+                                if abs_q + 1 < self.source.len() {
+                                    let next_str = &self.source[abs_q+1..];
+                                    if let Some(c) = next_str.chars().next() {
+                                        scan_pos = (abs_q + 1 + c.len_utf8()) - inner_start;
+                                    } else {
+                                        scan_pos = self.source.len() - inner_start;
+                                    }
+                                } else {
+                                    scan_pos = self.source.len() - inner_start;
+                                }
+                            } else {
+                                // Found closing '
+                                current = abs_q + 1;
+                                found_close = true;
+                                break;
+                            }
+                        }
+                        
+                        if !found_close {
+                            current = self.source.len();
+                        }
+                    } else if char_found == b'$' {
+                        // Found Variable start
+                        
+                        // If we have accumulated text before this $, return it as Literal first
+                        if abs_p > start {
+                            let text = &self.source[start..abs_p];
+                            self.byte_idx = abs_p;
+                            return Ok(Some((Token::Literal(text), start..abs_p)));
+                        }
+                        
+                        // Valid variable start at start index
+                        self.byte_idx = abs_p;
+                        
+                        let var_token_opt = self.parse_variable(abs_p)?;
+                        if let Some(token) = var_token_opt {
+                             let end = self.byte_idx;
+                             return Ok(Some((token, start..end)));
+                        } else {
+                             unreachable!("parse_variable returned None");
+                        }
                     }
-                }
-                // Continue scanning
-                continue;
-            }
-
-            if c == '$' {
-                // If we have accumulated literal text before this $, return it first
-                if idx > 0 {
-                    let text = &self.source[start..current_abs_idx];
-                    self.byte_idx = current_abs_idx;
-                    return Ok(Some((Token::Literal(text), start..current_abs_idx)));
-                }
-
-                // Parse Variable
-                let var_token_opt = self.parse_variable(current_abs_idx)?;
-                if let Some(token) = var_token_opt {
-                    let end = self.byte_idx;
-                    return Ok(Some((token, start..end)));
-                } else {
-                     // It returned None if it wasn't a variable but a literal '$'
-                     // parse_variable set byte_idx? 
-                     // My parse_variable logic: "If not a variable... byte_idx = start_idx + 1; Ok(Some(Literal))"
-                     // So I need to adjust parse_variable signature or handle it.
-                     // But wait, parse_variable returns `Option<Token>`.
-                     // I'll update parse_variable to return `(Token, Range)` too?
-                     // Or scan_next handles range? 
-                     // parse_variable modifies self.byte_idx.
-                     // So range is start..self.byte_idx.
-                     // But parse_variable returns `Option<Token>`.
-                     // Let's rely on it.
-                     unreachable!("parse_variable should return a token if it advances");
+                },
+                None => {
+                    // No more special chars. Rest is literal.
+                    current = self.source.len();
                 }
             }
         }
         
-        // End of string, return remaining as literal
-        let text = &self.source[self.byte_idx..];
-        let start_pos = self.byte_idx;
-        self.byte_idx = self.source.len();
+        // Loop finished (reached end of string)
+        let text = &self.source[start..current];
+        self.byte_idx = current;
         if text.is_empty() {
-            Ok(None)
+             Ok(None)
         } else {
-            Ok(Some((Token::Literal(text), start_pos..self.source.len())))
+             Ok(Some((Token::Literal(text), start..current)))
         }
     }
 
@@ -140,14 +154,12 @@ impl<'a> Scanner<'a> {
 
     fn parse_command_substitution(&mut self, start_idx: usize) -> Result<Option<Token<'a>>, Error> {
         // $( ... )
-        // Command substitution parsing needs to handle nested parentheses and quotes, 
-        // similar to bash but simplified.
         let inner_start = start_idx + 2; // skip '$('
         let remaining = &self.source[inner_start..];
         
         let mut depth = 1;
         let mut in_single_quote = false;
-        let mut in_double_quote = false; // Just simplistic tracking
+        let mut in_double_quote = false;
         let mut end_idx = 0;
         let mut found = false;
 
@@ -159,7 +171,6 @@ impl<'a> Scanner<'a> {
                 }
             } else if in_double_quote {
                 if c == '"' {
-                     // Check for escaping? Simplified for now as per Sprout logic
                      in_double_quote = false;
                 } else if c == '\\' {
                     chars.next(); // skip next char
@@ -184,7 +195,6 @@ impl<'a> Scanner<'a> {
         }
 
         if !found {
-            // Unclosed command
             return Err(Error::SyntaxError(format!("Unclosed command substitution starting at {}", start_idx), start_idx));
         }
 
@@ -195,13 +205,9 @@ impl<'a> Scanner<'a> {
     }
 
     fn parse_simple_variable(&mut self, start_idx: usize) -> Result<Option<Token<'a>>, Error> {
-        // $VAR - scan until non-alphanumeric/underscore
-        // The first char was already checked to be alpha or _
-        // skip $ and first char
         let mut len = 1; // '$'
         let remaining = &self.source[start_idx + 1..];
         
-        // We need to match \w+ basically
         for c in remaining.chars() {
             if c.is_alphanumeric() || c == '_' {
                 len += c.len_utf8();
@@ -222,20 +228,9 @@ impl<'a> Scanner<'a> {
     }
 
     fn parse_braced_variable(&mut self, start_idx: usize) -> Result<Option<Token<'a>>, Error> {
-        // ${ ... }
-        // We need to find the closing '}' handling nested braces optionally? 
-        // Requirements say "Iterative resolution: Handles nested variable references".
-        // Usually, the scanner just finds the matching brace. Variable semantics are inner.
-        // But for ${VAR:-${OTHER}}, the inner part is the default value.
-        
-        // Scan for name first
         let inner_start = start_idx + 2; // skip '${'
-
-        
         let remaining = &self.source[inner_start..];
         
-        // Find end of generic variable block
-        // We need to account for nesting in the default value part: ${VAR:-${DEFAULT}}
         let mut balance = 1;
         let mut end_idx = 0;
         
@@ -258,45 +253,29 @@ impl<'a> Scanner<'a> {
         let content = &self.source[inner_start..end_idx];
         self.byte_idx = end_idx + 1; // skip '}'
 
-        // Now parse name and modifier from content
-        // content = "VAR:-default" or "VAR"
-        
-        // Find first separator
         let mut name_len = content.len();
-        let mut modifier = None; // (strict, conditional, value_start_idx)
-        
-        // Scan content for :, -, +
-        // Names are typically alpha numeric _. 
-        // But let's just look for the first occurrence of operator chars.
+        let mut modifier = None;
         
         for (i, c) in content.char_indices() {
             if c == ':' {
-               // Next should be - or + or ? (if supported, spec only says :- - :+ +)
-               // Check next
                if let Some(next_c) = content[i+1..].chars().next() {
                    if next_c == '-' {
-                       // :-
                        name_len = i;
-                       modifier = Some((true, false, i+2)); // strict=true, cond=false
+                       modifier = Some((true, false, i+2));
                        break;
                    } else if next_c == '+' {
-                       // :+
                        name_len = i;
                        modifier = Some((true, true, i+2));
                        break;
                    }
                }
-               // What if just ${VAR:stuff}? Spec doesn't mention it. 
-               // Bash supports offsets ${VAR:offset}. Spec only listed default/alt.
-               // We'll treat as part of name or invalid if strict? 
-               // Assume Spec is exhaustive: -, :-, +, :+
             } else if c == '-' {
                 name_len = i;
-                modifier = Some((false, false, i+1)); // strict=false, cond=false
+                modifier = Some((false, false, i+1));
                 break;
             } else if c == '+' {
                 name_len = i;
-                modifier = Some((false, true, i+1)); // strict=false, cond=true
+                modifier = Some((false, true, i+1));
                 break;
             }
         }

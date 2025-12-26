@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 regex = "1.10.4"
 serde = { version = "1.0", features = ["derive"], optional = true }
+memchr = "2.7"
 tokio = { version = "1.0", features = ["process", "rt"], optional = true }
 
 [features]
@@ -16,4 +17,9 @@ serde = ["dep:serde"]
 async = ["dep:tokio"]
 
 [dev-dependencies]
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+criterion = "0.5"
+tokio = { version = "1", features = ["full"] }
+
+[[bench]]
+name = "interpolator_bench"
+harness = false

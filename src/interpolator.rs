@@ -87,7 +87,9 @@ impl<'a> Interpolator<'a> {
         while let Some((token, range)) = scanner.scan_next()? {
              match token {
                  Token::Command(cmd) => {
-                     let output = self.execute_command(cmd).await?;
+                     // Recursively resolve variables inside the command string before execution
+                     let resolved_cmd = self.interpolate(cmd)?;
+                     let output = self.execute_command(&resolved_cmd).await?;
                      result.push_str(&source[last_pos..range.start]); // Append text before command
                      result.push_str(&output);
                      modified = true;
@@ -326,17 +328,12 @@ impl<'a> Interpolator<'a> {
              if self.config.features.conditionals {
                   // Normal conditional logic
                   match val_opt {
-                      Some(_) => {
-                           // Set and strict/loose doesn't matter for :+ vs + in our token (we only track strict for - vs :-)
-                           // Token says: strict means ':', conditional means '+'?
-                           // Token definition: strict: bool, conditional: bool.
-                           // Scanner: 
-                           // :+ -> strict=true, conditional=true
-                           // +  -> strict=false, conditional=true
-                           // :- -> strict=true, conditional=false
-                           // -  -> strict=false, conditional=false
+                      Some(v) => {
+                           // If strict (:+) and value is empty, treat as unset (no substitution)
+                           if strict && v.is_empty() {
+                               return Ok(Cow::Borrowed(""));
+                           }
                            
-                           // Sprout config "conditionals" covers both :+ and +.
                            if let Some(def_raw) = effective_default {
                                return self.resolve(def_raw, depth + 1);
                            }
