@@ -2,14 +2,14 @@ mod config;
 mod context;
 mod error;
 mod interpolator;
-mod scanner;
+pub mod scanner;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::interpolator::Interpolator;
 
-pub use config::Config;
+pub use config::{Config, FeatureConfig};
 pub use context::{SimpleContext, VariableProvider};
 pub use error::Error;
 
