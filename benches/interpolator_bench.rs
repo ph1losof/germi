@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use germi::{Germi, Config};
+use germi::Germi;
 
 fn benchmark_interpolator(c: &mut Criterion) {
     let mut group = c.benchmark_group("interpolator");
