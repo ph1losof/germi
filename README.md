@@ -18,7 +18,7 @@ Add `germi` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-germi = "0.2.0"
+germi = "0.2.1"
 # For async command substitution:
 # germi = { version = "0.2.0", features = ["async"] }
 ```

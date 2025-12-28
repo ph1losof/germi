@@ -26,7 +26,9 @@ pub struct SimpleContext {
 
 impl SimpleContext {
     pub fn new() -> Self {
-        Self { vars: HashMap::new() }
+        Self {
+            vars: HashMap::new(),
+        }
     }
 
     pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) {
@@ -39,4 +41,3 @@ impl VariableProvider for SimpleContext {
         self.vars.get(key).map(|s| s.as_str())
     }
 }
-// Actually, I'll rewrite this cleanly right now instead of editing it later.

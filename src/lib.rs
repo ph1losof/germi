@@ -13,6 +13,8 @@ pub use config::{Config, FeatureConfig};
 pub use context::{SimpleContext, VariableProvider};
 pub use error::Error;
 
+use std::collections::HashSet;
+
 /// Main entry point for the Germi interpolation engine.
 #[derive(Debug, Clone)]
 pub struct Germi {
@@ -53,7 +55,11 @@ impl Germi {
     }
 
     /// Interpolate a string using temporary additional variables.
-    pub fn interpolate_with<'b>(&self, input: &'b str, extra_vars: &HashMap<String, String>) -> Result<Cow<'b, str>, Error> {
+    pub fn interpolate_with<'b>(
+        &self,
+        input: &'b str,
+        extra_vars: &HashMap<String, String>,
+    ) -> Result<Cow<'b, str>, Error> {
         let interpolator = Interpolator::new(&self.context, &self.config);
         interpolator.interpolate_with(input, extra_vars)
     }
@@ -65,4 +71,20 @@ impl Germi {
         let interpolator = Interpolator::new(&self.context, &self.config);
         interpolator.interpolate_async(input).await
     }
+}
+
+pub fn find_variable_references(input: &str) -> Vec<String> {
+    let mut scanner = scanner::Scanner::new(input);
+    let mut variables = HashSet::new();
+
+    while let Ok(Some((token, _))) = scanner.scan_next() {
+        if let scanner::Token::Variable { name, .. } = token {
+            variables.insert(name.to_string());
+        }
+    }
+
+    // Convert to sorted Vec for deterministic ordering
+    let mut result: Vec<String> = variables.into_iter().collect();
+    result.sort();
+    result
 }
