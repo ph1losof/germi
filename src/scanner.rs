@@ -16,6 +16,9 @@ pub enum Token<'a> {
     Command(&'a str),
     /// Command substitution using legacy `cmd` backtick syntax
     BacktickCommand(&'a str),
+    /// Escaped character that should be output literally (e.g., \` -> `, \$ -> $)
+    /// This preserves escape semantics through both sync and async passes
+    Escape(char),
 }
 
 #[derive(Debug)]
@@ -56,16 +59,30 @@ impl<'a> Scanner<'a> {
                     let char_found = self.source.as_bytes()[abs_p];
                     
                     if char_found == b'\\' {
-                        // Backslash escape. Skip this backslash and the next character.
+                        // Check if next character is ` or $ (command-related escapes)
                         if abs_p + 1 < self.source.len() {
-                            let next_str = &self.source[abs_p+1..];
+                            let next_byte = self.source.as_bytes()[abs_p + 1];
+                            if next_byte == b'`' || next_byte == b'$' {
+                                // Emit accumulated literal first
+                                if abs_p > start {
+                                    let text = &self.source[start..abs_p];
+                                    self.byte_idx = abs_p;
+                                    return Ok(Some((Token::Literal(text), start..abs_p)));
+                                }
+                                // Emit Escape token
+                                let escaped_char = next_byte as char;
+                                self.byte_idx = abs_p + 2; // skip both \ and the escaped char
+                                return Ok(Some((Token::Escape(escaped_char), abs_p..abs_p + 2)));
+                            }
+                            // Other escapes: skip and include in literal
+                            let next_str = &self.source[abs_p + 1..];
                             if let Some(c) = next_str.chars().next() {
                                 current = abs_p + 1 + c.len_utf8();
                             } else {
                                 current = self.source.len();
                             }
                         } else {
-                             current = self.source.len();
+                            current = self.source.len();
                         }
                     } else if char_found == b'\'' {
                         // Single quote block. Skip until closing quote.

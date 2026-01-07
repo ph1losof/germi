@@ -31,16 +31,11 @@ impl<'a> Interpolator<'a> {
     /// Returns `Cow::Borrowed` if no interpolation happened (zero-copy), or `Cow::Owned`
     /// if the string was modified.
     pub fn interpolate<'b>(&self, input: &'b str) -> Result<Cow<'b, str>, Error> {
-        let result = self.resolve(input, 0)?;
-        // Restore placeholder characters for sync-only path
-        Self::maybe_restore_placeholders(result)
+        self.resolve(input, 0, false)
     }
 
     /// Interpolate with additional temporary variables
     pub fn interpolate_with<'b>(&self, input: &'b str, extra_vars: &HashMap<String, String>) -> Result<Cow<'b, str>, Error> {
-         // Create a temporary provider that merges context + extra_vars
-         // Or simpler: We can just use a Chained Provider?
-         // Since VariableProvider is a trait, we can make a struct `OverlayProvider<'a, P>`.
          let overlay = OverlayProvider {
              base: self.context,
              overlay: extra_vars,
@@ -51,34 +46,57 @@ impl<'a> Interpolator<'a> {
              config: self.config,
          };
 
-         let result = temp_interpolator.resolve(input, 0)?;
-         // Restore placeholder characters for sync-only path
-         Self::maybe_restore_placeholders(result)
+         temp_interpolator.resolve(input, 0, false)
     }
 
     #[cfg(feature = "async")]
     pub async fn interpolate_async<'b>(&self, input: &'b str) -> Result<Cow<'b, str>, Error> {
         // First pass: Variable Interpolation (Sync)
-        // Use resolve directly to keep placeholders for command processing
-        let resolved_vars = self.resolve(input, 0)?;
+        // Preserve command-related escapes for async pass to handle
+        let resolved_vars = self.resolve(input, 0, true)?;
 
         // Second pass: Command Substitution (Async)
         // Only if commands or backtick_commands are enabled
         if self.config.features.commands || self.config.features.backtick_commands {
              self.resolve_commands(resolved_vars).await
         } else {
-             // Restore placeholders if no command processing
-             Self::maybe_restore_placeholders(resolved_vars)
+             // No command processing, but we need to resolve any preserved escapes
+             self.finalize_escapes(resolved_vars)
         }
     }
 
-    /// Restore placeholder characters if present, maintaining Cow semantics
-    fn maybe_restore_placeholders<'b>(input: Cow<'b, str>) -> Result<Cow<'b, str>, Error> {
-        let s = input.as_ref();
-        if s.contains(Self::ESCAPED_BACKTICK_PLACEHOLDER)
-            || s.contains(Self::ESCAPED_DOLLAR_PLACEHOLDER)
-        {
-            Ok(Cow::Owned(Self::restore_escaped_chars(s)))
+    /// Resolve preserved escape sequences (used when async commands are disabled)
+    #[cfg(feature = "async")]
+    fn finalize_escapes<'b>(&self, input: Cow<'b, str>) -> Result<Cow<'b, str>, Error> {
+        let source = input.as_ref();
+        if !source.contains('\\') {
+            return Ok(input);
+        }
+
+        let mut scanner = Scanner::new(source);
+        let mut result = String::with_capacity(source.len());
+        let mut last_pos = 0;
+        let mut modified = false;
+
+        while let Some((token, range)) = scanner.scan_next()? {
+            match token {
+                Token::Escape(c) => {
+                    result.push_str(&source[last_pos..range.start]);
+                    result.push(c);
+                    modified = true;
+                },
+                _ => {
+                    result.push_str(&source[range.clone()]);
+                }
+            }
+            last_pos = range.end;
+        }
+
+        if modified {
+            if last_pos < source.len() {
+                result.push_str(&source[last_pos..]);
+            }
+            Ok(Cow::Owned(result))
         } else {
             Ok(input)
         }
@@ -86,25 +104,15 @@ impl<'a> Interpolator<'a> {
 
     #[cfg(feature = "async")]
     async fn resolve_commands<'b>(&self, input: Cow<'b, str>) -> Result<Cow<'b, str>, Error> {
-        // We need to scan again for Command tokens.
-        // Scanner works on &str.
         let source = match &input {
             Cow::Borrowed(s) => s,
             Cow::Owned(s) => s.as_str(),
         };
 
-        // Quick check: if no command syntax and no placeholders, return as-is
-        let has_commands = source.contains("$(") || source.contains('`');
-        let has_placeholders = source.contains(Self::ESCAPED_BACKTICK_PLACEHOLDER)
-            || source.contains(Self::ESCAPED_DOLLAR_PLACEHOLDER);
-
-        if !has_commands && !has_placeholders {
+        // Quick check: if no command syntax, return as-is
+        // Note: We still need to scan if there might be Escape tokens from first pass
+        if !source.contains("$(") && !source.contains('`') && !source.contains('\\') {
             return Ok(input);
-        }
-
-        // If only placeholders but no commands, just restore placeholders
-        if !has_commands && has_placeholders {
-            return Ok(Cow::Owned(Self::restore_escaped_chars(source)));
         }
 
         let mut scanner = Scanner::new(source);
@@ -115,36 +123,35 @@ impl<'a> Interpolator<'a> {
         while let Some((token, range)) = scanner.scan_next()? {
              match token {
                  Token::Command(cmd) => {
-                     // Check if commands are enabled
                      if self.config.features.commands {
-                         // Recursively resolve variables inside the command string before execution
-                         // Use resolve directly to keep placeholders, then restore them for the command
-                         let resolved_cmd = self.resolve(cmd, 0)?;
-                         let cmd_str = Self::restore_escaped_chars(&resolved_cmd);
-                         let output = self.execute_command(&cmd_str).await?;
-                         result.push_str(&source[last_pos..range.start]); // Append text before command
+                         // Resolve variables inside command, don't preserve escapes
+                         let resolved_cmd = self.resolve(cmd, 0, false)?;
+                         let output = self.execute_command(&resolved_cmd).await?;
+                         result.push_str(&source[last_pos..range.start]);
                          result.push_str(&output);
                          modified = true;
                      } else {
-                         // Commands disabled, treat as literal
                          result.push_str(&source[range.clone()]);
                      }
                  },
                  Token::BacktickCommand(cmd) => {
-                     // Check if backtick commands are enabled
                      if self.config.features.backtick_commands {
-                         // Recursively resolve variables inside the command string before execution
-                         // Use resolve directly to keep placeholders, then restore them for the command
-                         let resolved_cmd = self.resolve(cmd, 0)?;
-                         let cmd_str = Self::restore_escaped_chars(&resolved_cmd);
-                         let output = self.execute_command(&cmd_str).await?;
-                         result.push_str(&source[last_pos..range.start]); // Append text before command
+                         // Resolve variables inside command, don't preserve escapes
+                         let resolved_cmd = self.resolve(cmd, 0, false)?;
+                         let output = self.execute_command(&resolved_cmd).await?;
+                         result.push_str(&source[last_pos..range.start]);
                          result.push_str(&output);
                          modified = true;
                      } else {
-                         // Backtick commands disabled, treat as literal
                          result.push_str(&source[range.clone()]);
                      }
+                 },
+                 Token::Escape(c) => {
+                     // Escape tokens are emitted by scanner for \` and \$
+                     // Output the escaped character literally (not interpreted as command)
+                     result.push_str(&source[last_pos..range.start]);
+                     result.push(c);
+                     modified = true;
                  },
                  _ => {
                      // Literals and Variables (already resolved in first pass)
@@ -158,18 +165,9 @@ impl<'a> Interpolator<'a> {
             if last_pos < source.len() {
                 result.push_str(&source[last_pos..]);
             }
-            // Restore escaped characters (backticks and dollar signs)
-            let final_result = Self::restore_escaped_chars(&result);
-            Ok(Cow::Owned(final_result))
+            Ok(Cow::Owned(result))
         } else {
-            // Even if no commands were executed, we may have placeholder chars to restore
-            if source.contains(Self::ESCAPED_BACKTICK_PLACEHOLDER)
-                || source.contains(Self::ESCAPED_DOLLAR_PLACEHOLDER)
-            {
-                Ok(Cow::Owned(Self::restore_escaped_chars(source)))
-            } else {
-                Ok(input)
-            }
+            Ok(input)
         }
     }
     
@@ -197,35 +195,21 @@ impl<'a> Interpolator<'a> {
         Ok(stdout.trim_end().to_string())
     }
 
-    fn resolve<'b>(&self, input: &'b str, depth: usize) -> Result<Cow<'b, str>, Error> {
+    /// Internal resolve function.
+    /// `preserve_cmd_escapes`: if true, preserve \` and \$ escapes for later processing
+    fn resolve<'b>(&self, input: &'b str, depth: usize, preserve_cmd_escapes: bool) -> Result<Cow<'b, str>, Error> {
         if depth > self.config.max_depth {
             return Err(Error::RecursiveLookup(input.to_string()));
         }
-        
-        // Short-circuit if variable interpolation is disabled
-        if !self.config.features.variables {
-             // We still might need to process escapes or commands?
-             // Sprout logic: if !variables, return valid input?
-             // But escapes?
-             // Let's assume generic flow. Tokenizer finds variables.
-             // If disabled, we treat them as literals?
-             // Scanner doesn't know config.
-             // So here we check.
-        }
 
         let mut scanner = Scanner::new(input);
-        
-        // Optimistic check: if no special chars found, return borrowed
-        // But scanner does the finding. 
-        // We iterate tokens.
-        
         let mut result: Option<String> = None;
         let mut last_pos = 0;
-        
+
         while let Some((token, range)) = scanner.scan_next()? {
             // If it's the first modification, initialize result
             if result.is_none() {
-                 match token {
+                 match &token {
                      Token::Literal(_) => {
                          // No change yet
                      },
@@ -235,16 +219,21 @@ impl<'a> Interpolator<'a> {
                          s.push_str(&input[0..range.start]);
                          result = Some(s);
                      },
+                     Token::Escape(_) => {
+                         // Only causes change if not preserving
+                         if !preserve_cmd_escapes {
+                             let mut s = String::with_capacity(input.len() + 32);
+                             s.push_str(&input[0..range.start]);
+                             result = Some(s);
+                         }
+                     },
                      Token::Command(_) | Token::BacktickCommand(_) => {
-                         // In sync interpolate, we treat commands as literals (or ignore them)
-                         // But we must NOT switch to owned if it's just a Command we are not processing?
-                         // If we are respecting "pure sync", we output $(cmd) or `cmd` literally.
-                         // So it is effectively a literal.
+                         // In sync interpolate, we treat commands as literals
                          // No change needed.
                      }
                  }
             }
-            
+
             if let Some(res) = &mut result {
                  // Append literal or resolved value
                  match token {
@@ -257,7 +246,7 @@ impl<'a> Interpolator<'a> {
                      },
                      Token::Variable { name, default, strict, conditional } => {
                          if self.config.features.variables {
-                             let val = self.resolve_variable(name, default, strict, conditional, depth)?;
+                             let val = self.resolve_variable(name, default, strict, conditional, depth, preserve_cmd_escapes)?;
                              res.push_str(&val);
                          } else {
                              res.push_str(&input[range.clone()]);
@@ -266,6 +255,15 @@ impl<'a> Interpolator<'a> {
                      Token::Command(_) | Token::BacktickCommand(_) => {
                          // In sync mode, commands are treated as literals
                          res.push_str(&input[range.clone()]);
+                     },
+                     Token::Escape(c) => {
+                         if preserve_cmd_escapes {
+                             // Keep original escape sequence for async pass
+                             res.push_str(&input[range.clone()]);
+                         } else {
+                             // Resolve escape: output the character
+                             res.push(c);
+                         }
                      }
                  }
             } else {
@@ -280,10 +278,10 @@ impl<'a> Interpolator<'a> {
                      }
                 }
             }
-             
+
             last_pos = range.end;
         }
-        
+
         if let Some(mut res) = result {
             if last_pos < input.len() {
                 let tail = &input[last_pos..];
@@ -296,7 +294,8 @@ impl<'a> Interpolator<'a> {
             Ok(Cow::Owned(res))
         } else {
              // Input might have escapes that need processing even if no variables
-             if self.config.features.escapes && input.contains('\\') {
+             // BUT if preserve_cmd_escapes is true, we return as-is (escapes preserved)
+             if self.config.features.escapes && input.contains('\\') && !preserve_cmd_escapes {
                  let mut res = String::with_capacity(input.len());
                  Self::unescape_into(&mut res, input);
                  Ok(Cow::Owned(res))
@@ -306,11 +305,8 @@ impl<'a> Interpolator<'a> {
         }
     }
     
-    // Placeholder characters for escaped command substitution syntax.
-    // These are converted back to the actual characters after async command processing.
-    const ESCAPED_BACKTICK_PLACEHOLDER: char = '\x00';
-    const ESCAPED_DOLLAR_PLACEHOLDER: char = '\x01';
-
+    /// Unescape standard escape sequences in a string.
+    /// Note: \` and \$ are handled by the scanner as Escape tokens, not here.
     fn unescape_into(buf: &mut String, s: &str) {
         let mut chars = s.chars().peekable();
         while let Some(c) = chars.next() {
@@ -322,19 +318,9 @@ impl<'a> Interpolator<'a> {
                     Some('\\') => buf.push('\\'),
                     Some('"') => buf.push('"'),
                     Some('\'') => buf.push('\''),
-                    Some('`') => {
-                        // Use placeholder for escaped backtick to avoid async pass interpreting it
-                        buf.push(Self::ESCAPED_BACKTICK_PLACEHOLDER);
-                    }
-                    Some('$') => {
-                        // Use placeholder for escaped dollar to avoid async pass interpreting $(...)
-                        buf.push(Self::ESCAPED_DOLLAR_PLACEHOLDER);
-                    }
+                    // Note: \` and \$ won't appear here - they're emitted as Escape tokens
                     Some(other) => {
-                        // Unknown escape, keep backslash and char?
-                        // Or Just push char?
-                        // Bash: \c -> c.
-                        // We'll behave like bash for consistency unless specified.
+                        // Unknown escape: Bash behavior is \c -> c
                         buf.push(other);
                     }
                     None => {
@@ -347,19 +333,8 @@ impl<'a> Interpolator<'a> {
             }
         }
     }
-
-    /// Convert placeholder characters back to their actual characters
-    fn restore_escaped_chars(s: &str) -> String {
-        s.chars()
-            .map(|c| match c {
-                Self::ESCAPED_BACKTICK_PLACEHOLDER => '`',
-                Self::ESCAPED_DOLLAR_PLACEHOLDER => '$',
-                _ => c,
-            })
-            .collect()
-    }
     
-    fn resolve_variable<'b>(&self, name: &str, default: Option<&'b str>, strict: bool, conditional: bool, depth: usize) -> Result<Cow<'b, str>, Error> {
+    fn resolve_variable<'b>(&self, name: &str, default: Option<&'b str>, strict: bool, conditional: bool, depth: usize, preserve_cmd_escapes: bool) -> Result<Cow<'b, str>, Error> {
         let val_opt = self.context.get_value(name);
 
         // Determine effective modifier based on feature flags
@@ -370,90 +345,58 @@ impl<'a> Interpolator<'a> {
             _ => (false, false, false), // No modifier or not relevant
         };
 
-        // If the specific feature is disabled, we treat it as if no modifier was provided (default = None)
-        // effectively falling back to basic ${VAR} resolution.
-        
         let effective_default = if use_default || use_alternate || use_conditional {
             default
         } else {
             None
         };
 
-        // If conditional is requested but disabled, treat as normal var lookup?
-        // Wait, ${VAR:+val} with conditionals=false should behave like ${VAR}?
-        // Or should it error? Or behave like empty?
-        // Assuming "disabled" means "syntax ignored, return variable value".
-        
-        // Re-evaluate logic with effective flags:
-        
         if conditional {
              if self.config.features.conditionals {
-                  // Normal conditional logic
                   match val_opt {
                       Some(v) => {
-                           // If strict (:+) and value is empty, treat as unset (no substitution)
                            if strict && v.is_empty() {
                                return Ok(Cow::Borrowed(""));
                            }
-                           
+
                            if let Some(def_raw) = effective_default {
-                               return self.resolve(def_raw, depth + 1);
+                               return self.resolve(def_raw, depth + 1, preserve_cmd_escapes);
                            }
                            return Ok(Cow::Borrowed(""));
                       },
                       None => return Ok(Cow::Borrowed("")),
                   }
-             } else {
-                 // Feature disabled: treat as ${VAR} (ignore :+val)
-                 // FALL THROUGH to normal lookup below
              }
         }
 
-        // Logic for Defaults (:-) and Alternates (-)
-        // We simplified above by masking `default`.
-        // If we masked `default` to None, the match below handles it as basic var lookup.
-        
         match (val_opt, strict) {
              (Some(v), _) => {
-                 // Variable exists.
-                 // For defaults/alternates, we use the variable value.
-                 // Unless it's empty AND strict=true AND it's a default modifier (not conditional)
-                 
-                 // If strict=true (:-) and value is empty:
                  if !conditional && strict && v.is_empty() {
-                      // Only use default if defaults feature is enabled!
                       if self.config.features.defaults {
                            if let Some(def_raw) = default {
-                               return self.resolve(def_raw, depth + 1);
+                               return self.resolve(def_raw, depth + 1, preserve_cmd_escapes);
                            }
                       }
                  }
-                 
-                 // Otherwise return value
-                 let resolved = self.resolve(v, depth + 1)?;
+
+                 let resolved = self.resolve(v, depth + 1, preserve_cmd_escapes)?;
                  Ok(Cow::Owned(resolved.into_owned()))
              },
              (None, _) => {
-                 // Variable Unset
-                 // Use default if provided AND feature enabled AND not a conditional
-                 
                  if !conditional {
-                     // Case 1: :- (strict=true). Feature: defaults.
                      if strict && self.config.features.defaults {
                           if let Some(def_raw) = default {
-                              return self.resolve(def_raw, depth + 1);
+                              return self.resolve(def_raw, depth + 1, preserve_cmd_escapes);
                           }
                      }
-                     
-                     // Case 2: - (strict=false). Feature: alternates.
+
                      if !strict && self.config.features.alternates {
                           if let Some(def_raw) = default {
-                              return self.resolve(def_raw, depth + 1);
+                              return self.resolve(def_raw, depth + 1, preserve_cmd_escapes);
                           }
                      }
                  }
-                 
-                 // Fallback: No default or feature disabled.
+
                  Err(Error::MissingVar(name.to_string()))
              }
         }
