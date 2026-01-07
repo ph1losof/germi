@@ -12,7 +12,10 @@ pub enum Token<'a> {
         /// If true, this is a conditional substitution like `${VAR:+val}`
         conditional: bool,
     },
+    /// Command substitution using $(cmd) syntax
     Command(&'a str),
+    /// Command substitution using legacy `cmd` backtick syntax
+    BacktickCommand(&'a str),
 }
 
 #[derive(Debug)]
@@ -36,8 +39,18 @@ impl<'a> Scanner<'a> {
 
         while current < self.source.len() {
             let rem = &self.source.as_bytes()[current..];
-            
-            match memchr::memchr3(b'$', b'\\', b'\'', rem) {
+
+            // memchr only supports up to 3 chars, so we find min of two searches
+            let pos_special = memchr::memchr3(b'$', b'\\', b'\'', rem);
+            let pos_backtick = memchr::memchr(b'`', rem);
+            let combined = match (pos_special, pos_backtick) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+
+            match combined {
                 Some(p) => {
                     let abs_p = current + p;
                     let char_found = self.source.as_bytes()[abs_p];
@@ -92,23 +105,43 @@ impl<'a> Scanner<'a> {
                         }
                     } else if char_found == b'$' {
                         // Found Variable start
-                        
+
                         // If we have accumulated text before this $, return it as Literal first
                         if abs_p > start {
                             let text = &self.source[start..abs_p];
                             self.byte_idx = abs_p;
                             return Ok(Some((Token::Literal(text), start..abs_p)));
                         }
-                        
+
                         // Valid variable start at start index
                         self.byte_idx = abs_p;
-                        
+
                         let var_token_opt = self.parse_variable(abs_p)?;
                         if let Some(token) = var_token_opt {
                              let end = self.byte_idx;
                              return Ok(Some((token, start..end)));
                         } else {
                              unreachable!("parse_variable returned None");
+                        }
+                    } else if char_found == b'`' {
+                        // Found backtick command substitution start
+
+                        // If we have accumulated text before this `, return it as Literal first
+                        if abs_p > start {
+                            let text = &self.source[start..abs_p];
+                            self.byte_idx = abs_p;
+                            return Ok(Some((Token::Literal(text), start..abs_p)));
+                        }
+
+                        // Parse backtick command
+                        self.byte_idx = abs_p;
+
+                        let backtick_token_opt = self.parse_backtick_command(abs_p)?;
+                        if let Some(token) = backtick_token_opt {
+                             let end = self.byte_idx;
+                             return Ok(Some((token, start..end)));
+                        } else {
+                             unreachable!("parse_backtick_command returned None");
                         }
                     }
                 },
@@ -200,8 +233,52 @@ impl<'a> Scanner<'a> {
 
         let cmd = &self.source[inner_start..end_idx];
         self.byte_idx = end_idx + 1; // skip ')'
-        
+
         Ok(Some(Token::Command(cmd)))
+    }
+
+    fn parse_backtick_command(&mut self, start_idx: usize) -> Result<Option<Token<'a>>, Error> {
+        // `command`
+        let inner_start = start_idx + 1; // skip opening backtick
+        let remaining = &self.source[inner_start..];
+
+        let mut end_idx = 0;
+        let mut found = false;
+
+        let mut chars = remaining.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => {
+                    // Handle escapes inside backticks
+                    // Only \` and \\ are meaningful escapes inside backticks
+                    if let Some((_, next_c)) = chars.next() {
+                        match next_c {
+                            '`' | '\\' => continue, // escaped, skip
+                            _ => {} // pass through (backslash consumed with next char)
+                        }
+                    }
+                }
+                '`' => {
+                    // Found closing backtick
+                    end_idx = inner_start + i;
+                    found = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if !found {
+            return Err(Error::SyntaxError(
+                format!("Unclosed backtick command starting at {}", start_idx),
+                start_idx,
+            ));
+        }
+
+        let cmd = &self.source[inner_start..end_idx];
+        self.byte_idx = end_idx + 1; // skip closing backtick
+
+        Ok(Some(Token::BacktickCommand(cmd)))
     }
 
     fn parse_simple_variable(&mut self, start_idx: usize) -> Result<Option<Token<'a>>, Error> {

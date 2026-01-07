@@ -16,6 +16,8 @@ pub struct FeatureConfig {
     pub escapes: bool,
     /// Enable command substitution ($(cmd))
     pub commands: bool,
+    /// Enable backtick command substitution (`cmd`)
+    pub backtick_commands: bool,
 }
 
 impl Default for FeatureConfig {
@@ -27,6 +29,7 @@ impl Default for FeatureConfig {
             conditionals: true,
             escapes: true,
             commands: true,
+            backtick_commands: true,
         }
     }
 }
